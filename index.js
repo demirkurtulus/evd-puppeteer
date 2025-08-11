@@ -83,7 +83,7 @@ async function robustLogin(browser, account) {
   browser.on("targetcreated", onTargetCreated);
 
   // Giriş sayfasına git (business'a devam parametresi ile)
-  await page.goto("https://accounts.google.com/signin/v2/identifier?service=business&hl=tr&continue=https://business.google.com/", { waitUntil: "domcontentloaded" });
+  await page.goto("https://accounts.google.com/", { waitUntil: "domcontentloaded" });
 
   // 1) E-posta
   await page.waitForSelector('input[type="email"], input[name="identifier"]', { visible: true });
