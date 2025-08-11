@@ -52,62 +52,186 @@ async function downloadFromDrive(fileId, destPath) {
   return destPath;
 }
 
+async function robustLogin(browser, account) {
+  // Aktif sayfayı yönetebilmek için helper
+  const getActivePage = async () => {
+    const pages = await browser.pages();
+    return pages[pages.length - 1];
+  };
+
+  let page = await browser.newPage();
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+  );
+  await page.setExtraHTTPHeaders({ "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7" });
+  await page.setViewport({ width: 1280, height: 800 });
+  page.setDefaultTimeout(30000);
+
+  // Yeni hedef açılırsa ona geç
+  const onTargetCreated = async (target) => {
+    try {
+      if (target.type() === "page") {
+        const newPage = await target.page();
+        // bazen boş/arka plan açılıyor; URL yüklendiyse geç
+        const url = newPage.url();
+        if (url && !url.startsWith("about:blank")) {
+          page = newPage;
+        }
+      }
+    } catch {}
+  };
+  browser.on("targetcreated", onTargetCreated);
+
+  // Giriş sayfasına git (business'a devam parametresi ile)
+  await page.goto("https://accounts.google.com/signin/v2/identifier?service=business&hl=tr&continue=https://business.google.com/", { waitUntil: "domcontentloaded" });
+
+  // 1) E-posta
+  await page.waitForSelector('input[type="email"], input[name="identifier"]', { visible: true });
+  await page.type('input[type="email"], input[name="identifier"]', account.email, { delay: 20 });
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "networkidle0" }).catch(() => {}), // bazen tam nav olmuyor
+    page.click('#identifierNext'),
+  ]);
+
+  // 2) Şifre alanını çeşitli selector’larla ara
+  async function waitForPasswordField() {
+    const selectors = [
+      'input[name="Passwd"]',
+      'input[type="password"]',
+      'input[aria-label="Şifre"]',
+      'input[autocomplete="current-password"]',
+    ];
+    for (const sel of selectors) {
+      const el = await page.$(sel);
+      if (el) return sel;
+    }
+    // gelmediyse biraz bekleyip tekrar dene
+    await page.waitForTimeout(1500);
+    for (const sel of selectors) {
+      const el = await page.$(sel);
+      if (el) return sel;
+    }
+    return null;
+  }
+
+  // Bazı hesaplarda önce "Hesabı seç" ekranı çıkabilir
+  const accountChooser = await page.$('div[role="button"][data-identifier], div[data-identifier]');
+  if (accountChooser) {
+    // eposta ile eşleşeni bul
+    const buttons = await page.$$('[data-identifier]');
+    for (const b of buttons) {
+      const v = await b.evaluate((el) => el.getAttribute("data-identifier"));
+      if (v === account.email) {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: "networkidle0" }).catch(() => {}),
+          b.click(),
+        ]);
+        break;
+      }
+    }
+  }
+
+  // Şifre
+  let passSel = await waitForPasswordField();
+  if (!passSel) {
+    // bazen tekrar e-posta sorup sonra şifreye geçiyor; sayfayı bekletip yeniden dene
+    await page.waitForTimeout(2000);
+    passSel = await waitForPasswordField();
+  }
+  if (!passSel) {
+    // consent / continue ekranı olabilir
+    const contBtn = await page.$('button:has-text("Devam"), div[role="button"]:has-text("Devam")');
+    if (contBtn) {
+      await Promise.all([page.waitForNavigation({ waitUntil: "networkidle0" }).catch(() => {}), contBtn.click()]);
+      passSel = await waitForPasswordField();
+    }
+  }
+  if (!passSel) {
+    throw new Error("PASSWORD_FIELD_NOT_FOUND");
+  }
+
+  await page.type(passSel, account.password, { delay: 20 });
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "networkidle0" }).catch(() => {}),
+    page.click('#passwordNext'),
+  ]);
+
+  // 2FA varsa
+  const otpSelectorCandidates = [
+    'input[type="tel"]',
+    'input[name="totpPin"]',
+    'input[autocomplete="one-time-code"]',
+  ];
+  const hasOtp = await (async () => {
+    for (const s of otpSelectorCandidates) {
+      if (await page.$(s)) return s;
+    }
+    return null;
+  })();
+
+  if (hasOtp) {
+    if (account.totpSecret) {
+      // otplib'i dışarıdan veriyoruz
+      const { authenticator } = (await import("otplib")).default || await import("otplib");
+      const code = authenticator.generate(account.totpSecret);
+      await page.type(hasOtp, code);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle0" }).catch(() => {}),
+        page.keyboard.press("Enter"),
+      ]);
+    } else {
+      browser.off("targetcreated", onTargetCreated);
+      throw new Error("REQUIRES_2FA");
+    }
+  }
+
+  // giriş tamam; event'i kaldır
+  browser.off("targetcreated", onTargetCreated);
+  return page;
+}
+
+
 // ---- Puppeteer oturumu ve yükleme ----
 async function withBrowser(accountKey, fn) {
   const account = ACCOUNTS[accountKey];
   if (!account) throw new Error("Unknown accountKey");
 
+  // Browserless'a bağlanırken defaultViewport'u kontrol etmek iyi olur
   const browser = await puppeteer.connect({
-    browserWSEndpoint: process.env.PUPPETEER_BROWSER_WSE
+    browserWSEndpoint: process.env.PUPPETEER_BROWSER_WSE,
+    defaultViewport: null
   });
-  const page = await browser.newPage();
 
-  // Hızlı login akışı
-  await page.goto("https://accounts.google.com/signin", { waitUntil: "networkidle0" });
-  await page.type('input[type="email"]', account.email);
-  await page.click("#identifierNext");
+  const page = await robustLogin(browser, account);
 
-  await page.waitForSelector('input[type="password"]', { visible: true });
-  await page.type('input[type="password"]', account.password);
-  await page.click("#passwordNext");
-
-  // 2FA ihtimali
-  try {
-    await page.waitForNavigation({ waitUntil: "networkidle0", timeout: 8000 });
-  } catch (_) {}
-  const otpSelector = 'input[type="tel"], input[name="totpPin"]';
-  const hasOtp = await page.$(otpSelector);
-  if (hasOtp) {
-    if (account.totpSecret) {
-      const code = otplib.authenticator.generate(account.totpSecret);
-      await page.type(otpSelector, code);
-      await page.keyboard.press("Enter");
-      await page.waitForNavigation({ waitUntil: "networkidle0" });
-    } else {
-      await browser.disconnect();
-      throw new Error("REQUIRES_2FA");
-    }
-  }
-
+  // Artık business paneline geçebiliriz:
   const result = await fn(page, browser);
+
   await browser.disconnect();
   return result;
 }
 
-async function uploadToGbp(page, { locationId, filePaths }) {
-  // Lokasyonun foto sayfasına git
-  await page.goto(`https://business.google.com/dashboard/l/${locationId}/photos`, { waitUntil: "networkidle0" });
 
-  // Yükleme butonu (gerekirse selector özelleştir)
+async function uploadToGbp(page, { locationId, filePaths }) {
+  // Doğrudan lokasyonun foto sayfasına
+  await page.goto(`https://business.google.com/dashboard/l/${locationId}/photos`, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1500);
+
+  // "Fotoğraf ekle" butonu için daha spesifik bir yaklaşım:
+  // 1) Önce görünür bir upload tetikleyicisi ara
+  const clickable = await page.$('div[role="button"], button');
+  if (!clickable) throw new Error("UPLOAD_BUTTON_NOT_FOUND");
+
   const [chooser] = await Promise.all([
     page.waitForFileChooser(),
-    page.waitForSelector('button,div[role="button"]', { visible: true })
-      .then(() => page.click('button,div[role="button"]'))
+    clickable.click(),
   ]);
 
   await chooser.accept(filePaths);
-  await page.waitForTimeout(15000); // yükleme süresi, istersen DOM kontrolü ekleyebilirsin
+  // Yükleme tamamlandı sinyali için kısa bir bekleme (gerekirse DOM kontrolü ile değiştir)
+  await page.waitForTimeout(20000);
 }
+
 
 // ---- API: Drive ID'leri ile yükleme ----
 app.post("/upload", async (req, res) => {
