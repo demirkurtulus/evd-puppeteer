@@ -21,9 +21,11 @@ app.use((req, res, next) => {
 const UPLOAD_DIR = "/app/uploads";
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// Hesap konfigleri (env: ACCOUNTS_JSON)
+// Hesap konfigleri (env: ACCOUNTS_JSON_B64)
 // Örnek: { "evd_main": { "email":"...", "password":"...", "totpSecret":"..." } }
-const ACCOUNTS = JSON.parse(process.env.ACCOUNTS_JSON || "{}");
+const ACCOUNTS = JSON.parse(
+  Buffer.from(process.env.ACCOUNTS_JSON_B64, "base64").toString("utf8")
+);
 
 // Hesap başına tek kuyruk (aynı anda tek oturum)
 const queues = new Map();
